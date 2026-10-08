@@ -105,16 +105,19 @@ class StorageControllerTests {
         mvc.perform(put("/uploads/{u}/parts/2", uploadId).content(part2)
                         .header("X-Checksum-Sha256", sha256(part2)))
                 .andExpect(status().isOk());
-        mvc.perform(post("/uploads/{u}/complete", uploadId).contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isOk());
+        MvcResult complete = mvc.perform(post("/uploads/{u}/complete", uploadId)
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andReturn();
+        String uploadVersion = mapper.readTree(complete.getResponse().getContentAsString()).get("versionId").asText();
         mvc.perform(get("/objects/file"))
                 .andExpect(status().isOk())
                 .andExpect(result -> assertEquals("hello-world", result.getResponse().getContentAsString()));
 
-        // 已完成会话再操作 -> 409 SESSION_EXPIRED；不存在会话 -> 404 SESSION_NOT_FOUND。
+        // 已完成会话重试完成 -> 幂等返回同一个版本（200）；不存在会话 -> 404 SESSION_NOT_FOUND。
         mvc.perform(post("/uploads/{u}/complete", uploadId).contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.code").value("SESSION_EXPIRED"));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.versionId").value(uploadVersion));
+        log.info("REST 完成重试: uploadId={} 重试返回同一 versionId={}", uploadId, uploadVersion);
         mvc.perform(post("/uploads/{u}/complete", "missing").contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("SESSION_NOT_FOUND"));
@@ -140,5 +143,15 @@ class StorageControllerTests {
         JsonNode gcBody = mapper.readTree(gc.getResponse().getContentAsString());
         log.info("REST GC: removedCount={}", gcBody.get("removedCount").asInt());
         assertEquals(1, gcBody.get("removedCount").asInt(), "v1 内容已无任何版本引用，必须被回收");
+
+        // 只读容量视图：GC 后无待回收内容，剩余内容全部被引用。
+        MvcResult stats = mvc.perform(get("/admin/stats")).andExpect(status().isOk()).andReturn();
+        JsonNode statsBody = mapper.readTree(stats.getResponse().getContentAsString());
+        log.info("REST 容量视图: {}", statsBody);
+        assertEquals(2, statsBody.get("totalBlobs").asInt(), "GC 后只剩 doc@v2 与 file 两份内容");
+        assertEquals(2, statsBody.get("referencedBlobs").asInt());
+        assertEquals(0, statsBody.get("reclaimableBlobs").asInt(), "GC 后不应再有可回收内容");
+        // 再次调用仍为只读：数据仍可读。
+        mvc.perform(get("/objects/file")).andExpect(status().isOk());
     }
 }

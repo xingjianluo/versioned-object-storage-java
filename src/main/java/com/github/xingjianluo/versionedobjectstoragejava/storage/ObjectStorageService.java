@@ -44,15 +44,46 @@ public class ObjectStorageService {
     /**
      * 启动恢复：
      * 1. 清理内容写入中断遗留的临时文件；
-     * 2. 已结束（完成/中止）会话的分片目录直接清理；
-     * 3. 活跃会话保留分片，可继续续传；
-     * 4. 元数据中没有对应会话记录的孤儿分片目录一律清理；
-     * 5. 校验所有可见版本指向的内容确实存在（防御性一致性检查）。
+     * 2. 收敛 COMMITTING 会话：预定版本已生效的补完为 COMPLETED；
+     *    版本未生效但内容已就位（先内容后元数据的顺序保证）的，补写版本元数据后标记 COMPLETED；
+     *    内容缺失的（防御性分支，正常不会发生）回滚为 ACTIVE，客户端可重新提交；
+     * 3. 已结束（完成/中止）会话的分片目录直接清理；
+     * 4. 活跃会话保留分片，可继续续传；
+     * 5. 元数据中没有对应会话记录的孤儿分片目录一律清理；
+     * 6. 校验所有可见版本指向的内容确实存在（防御性一致性检查）。
      */
     public synchronized void recover() throws IOException {
         int tmpRemoved = blobStore.cleanTempFiles();
         Files.createDirectories(uploadDir);
         Map<String, UploadSessionState> sessions = metadataStore.allSessions();
+        int commitFinished = 0;
+        int commitRolledBack = 0;
+        for (UploadSessionState session : sessions.values()) {
+            if (session.getStatus() != UploadSessionState.Status.COMMITTING) {
+                continue;
+            }
+            StoredVersion committed = session.getCommittedVersion();
+            if (committed != null && blobStore.exists(committed.contentHash())) {
+                // 内容在提交意图落盘前已写入内容存储，补完是安全的：
+                // 此刻元数据与崩溃瞬间一致，当时的条件更新检查结论仍然成立。
+                if (metadataStore.findVersion(session.getObjectKey(), committed.versionId()).isEmpty()) {
+                    metadataStore.appendVersion(session.getObjectKey(), committed);
+                    log.info("recover: 补完中断的提交 uploadId={} key={} versionId={}",
+                            session.getUploadId(), session.getObjectKey(), committed.versionId());
+                }
+                session.setStatus(UploadSessionState.Status.COMPLETED);
+                metadataStore.putSession(session);
+                commitFinished++;
+            } else {
+                // 防御性回滚：内容缺失说明提交未生效，回到 ACTIVE 允许客户端重试。
+                session.setStatus(UploadSessionState.Status.ACTIVE);
+                session.setCommittedVersion(null);
+                metadataStore.putSession(session);
+                commitRolledBack++;
+                log.warn("recover: 提交内容缺失，回滚会话 uploadId={} key={}",
+                        session.getUploadId(), session.getObjectKey());
+            }
+        }
         int orphanDirs = 0;
         int finishedDirs = 0;
         try (Stream<Path> stream = Files.list(uploadDir)) {
@@ -77,8 +108,8 @@ public class ObjectStorageService {
                 }
             }
         }
-        log.info("recover done: blobTmpRemoved={}, orphanUploadDirs={}, finishedUploadDirs={}, activeSessions={}",
-                tmpRemoved, orphanDirs, finishedDirs,
+        log.info("recover done: blobTmpRemoved={}, commitFinished={}, commitRolledBack={}, orphanUploadDirs={}, finishedUploadDirs={}, activeSessions={}",
+                tmpRemoved, commitFinished, commitRolledBack, orphanDirs, finishedDirs,
                 sessions.values().stream().filter(s -> s.getStatus() == UploadSessionState.Status.ACTIVE).count());
     }
 
@@ -195,9 +226,42 @@ public class ObjectStorageService {
         log.info("uploadPart uploadId={} part={} checksum={} -> 已接收", uploadId, partNumber, actual);
     }
 
-    /** 合并分片完成上传，产生新版本；分片必须连续从 1 开始且校验和全部匹配。 */
+    /**
+     * 合并分片完成上传，产生新版本；分片必须连续从 1 开始且校验和全部匹配。
+     * 提交采用两段式落盘，可放心重试：
+     * 1. 内容写入内容存储后，先把「提交意图」（COMMITTING + 预定版本）落盘，版本标识从此固定；
+     * 2. 追加版本元数据落盘，版本对外可见；
+     * 3. 会话标记 COMPLETED 落盘，清理分片。
+     * 客户端在任意时刻断线或进程退出后重试（含重启后重试）：
+     * 会话已 COMPLETED 时直接返回首次提交的同一个版本，不产生新版本；
+     * 进程在提交中途退出时，重启恢复会把会话收敛到 COMPLETED（补完）或 ACTIVE（可重新提交），
+     * 同一个上传会话永远只产生一个对象版本。并发重试由方法级互斥串行化，
+     * 只有第一个请求真正提交，其余请求拿到同一个结果。
+     */
     public synchronized StoredVersion completeUpload(String uploadId, String expectedVersionId) throws IOException {
-        UploadSessionState session = requireActiveSession(uploadId);
+        UploadSessionState session = metadataStore.getSession(uploadId)
+                .orElseThrow(() -> new ApiException(ErrorCode.SESSION_NOT_FOUND, HttpStatus.NOT_FOUND,
+                        "upload session not found: " + uploadId));
+        if (session.getStatus() == UploadSessionState.Status.COMPLETED) {
+            StoredVersion committed = session.getCommittedVersion();
+            if (committed != null) {
+                log.info("completeUpload uploadId={} 幂等重试 -> 返回首次提交的版本 versionId={}",
+                        uploadId, committed.versionId());
+                return committed;
+            }
+            // 兼容旧数据目录：历史 COMPLETED 会话没有记录提交结果，只能按会话失效处理。
+            throw new ApiException(ErrorCode.SESSION_EXPIRED, HttpStatus.CONFLICT,
+                    "upload session " + uploadId + " is COMPLETED (result not recorded)");
+        }
+        if (session.getStatus() == UploadSessionState.Status.ABORTED) {
+            throw new ApiException(ErrorCode.SESSION_EXPIRED, HttpStatus.CONFLICT,
+                    "upload session " + uploadId + " is ABORTED");
+        }
+        if (session.getStatus() == UploadSessionState.Status.COMMITTING) {
+            // 正常运行期不会出现（recover 已收敛）；防御性拒绝，提示重试触发收敛。
+            throw new ApiException(ErrorCode.SESSION_EXPIRED, HttpStatus.CONFLICT,
+                    "upload session " + uploadId + " is COMMITTING, retry after recovery");
+        }
         Map<Integer, String> parts = session.getParts();
         if (parts.isEmpty()) {
             throw new ApiException(ErrorCode.MISSING_PARTS, HttpStatus.BAD_REQUEST,
@@ -237,6 +301,10 @@ public class ObjectStorageService {
         }
         long size = Files.size(merged);
         StoredVersion version = new StoredVersion(MetadataStore.newVersionId(), hash, size, false, System.currentTimeMillis());
+        // 两段式提交：先落盘提交意图（版本标识固定），再让版本生效，最后标记完成。
+        session.setCommittedVersion(version);
+        session.setStatus(UploadSessionState.Status.COMMITTING);
+        metadataStore.putSession(session);
         metadataStore.appendVersion(session.getObjectKey(), version);
         session.setStatus(UploadSessionState.Status.COMPLETED);
         metadataStore.putSession(session);
@@ -270,16 +338,9 @@ public class ObjectStorageService {
         return removed;
     }
 
-    /** 回收不被任何非删除版本引用的内容，返回回收的内容哈希列表。 */
+    /** 回收不被任何非删除版本引用的内容，返回回收的内容哈希列表。可安全重跑：引用集每次从元数据重新计算。 */
     public synchronized List<String> garbageCollect() throws IOException {
-        Set<String> referenced = new HashSet<>();
-        for (List<StoredVersion> versions : metadataStore.allObjects().values()) {
-            for (StoredVersion v : versions) {
-                if (!v.deleted() && v.contentHash() != null) {
-                    referenced.add(v.contentHash());
-                }
-            }
-        }
+        Set<String> referenced = referencedHashes();
         List<String> removed = new ArrayList<>();
         for (String hash : blobStore.listAll()) {
             if (!referenced.contains(hash)) {
@@ -289,6 +350,45 @@ public class ObjectStorageService {
         }
         log.info("garbageCollect referenced={} removed={}", referenced.size(), removed.size());
         return removed;
+    }
+
+    /**
+     * 只读容量视图：统计磁盘占用、仍被引用的部分、以及不再被任何版本引用可安全释放的部分。
+     * 不删除、不修改任何数据，可任意时刻调用。
+     */
+    public synchronized StorageStats storageStats() throws IOException {
+        Set<String> referenced = referencedHashes();
+        Map<String, Long> onDisk = blobStore.listAllWithSizes();
+        long totalBytes = 0;
+        long referencedBytes = 0;
+        long referencedBlobs = 0;
+        for (Map.Entry<String, Long> e : onDisk.entrySet()) {
+            totalBytes += e.getValue();
+            if (referenced.contains(e.getKey())) {
+                referencedBlobs++;
+                referencedBytes += e.getValue();
+            }
+        }
+        StorageStats stats = new StorageStats(onDisk.size(), totalBytes,
+                referencedBlobs, referencedBytes,
+                onDisk.size() - referencedBlobs, totalBytes - referencedBytes);
+        log.info("storageStats totalBlobs={} totalBytes={} referencedBlobs={} referencedBytes={} reclaimableBlobs={} reclaimableBytes={}",
+                stats.totalBlobs(), stats.totalBytes(), stats.referencedBlobs(),
+                stats.referencedBytes(), stats.reclaimableBlobs(), stats.reclaimableBytes());
+        return stats;
+    }
+
+    /** 当前被至少一个非删除版本引用的内容哈希集合。 */
+    private Set<String> referencedHashes() {
+        Set<String> referenced = new HashSet<>();
+        for (List<StoredVersion> versions : metadataStore.allObjects().values()) {
+            for (StoredVersion v : versions) {
+                if (!v.deleted() && v.contentHash() != null) {
+                    referenced.add(v.contentHash());
+                }
+            }
+        }
+        return referenced;
     }
 
     private void checkConditional(String key, String expectedVersionId) {

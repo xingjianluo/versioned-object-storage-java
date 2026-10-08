@@ -1,6 +1,7 @@
 package com.github.xingjianluo.versionedobjectstoragejava.api;
 
 import com.github.xingjianluo.versionedobjectstoragejava.storage.ObjectStorageService;
+import com.github.xingjianluo.versionedobjectstoragejava.storage.StorageStats;
 import com.github.xingjianluo.versionedobjectstoragejava.storage.StoredVersion;
 import com.github.xingjianluo.versionedobjectstoragejava.storage.UploadSessionState;
 import org.slf4j.Logger;
@@ -137,5 +138,11 @@ public class StorageController {
     public Map<String, Object> gc() throws IOException {
         List<String> removed = service.garbageCollect();
         return Map.of("removed", removed, "removedCount", removed.size());
+    }
+
+    /** 只读容量视图：总占用、仍被引用、可安全释放；不产生任何删除。 */
+    @GetMapping("/admin/stats")
+    public StorageStats stats() throws IOException {
+        return service.storageStats();
     }
 }

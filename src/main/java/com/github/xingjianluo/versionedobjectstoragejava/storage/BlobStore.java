@@ -8,7 +8,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
@@ -74,16 +75,23 @@ public class BlobStore {
 
     /** 列出当前磁盘上全部内容哈希（忽略临时文件）。 */
     public Set<String> listAll() throws IOException {
-        Set<String> hashes = new HashSet<>();
+        return listAllWithSizes().keySet();
+    }
+
+    /** 列出当前磁盘上全部内容哈希及其字节大小（忽略临时文件）；只读，不修改任何数据。 */
+    public Map<String, Long> listAllWithSizes() throws IOException {
+        Map<String, Long> sizes = new HashMap<>();
         if (!Files.isDirectory(blobDir)) {
-            return hashes;
+            return sizes;
         }
         try (Stream<Path> stream = Files.list(blobDir)) {
-            stream.map(p -> p.getFileName().toString())
-                    .filter(name -> !name.startsWith("tmp-"))
-                    .forEach(hashes::add);
+            for (Path p : stream.filter(p -> !p.getFileName().toString().startsWith("tmp-")).toList()) {
+                if (Files.isRegularFile(p)) {
+                    sizes.put(p.getFileName().toString(), Files.size(p));
+                }
+            }
         }
-        return hashes;
+        return sizes;
     }
 
     /** 清理写入中断遗留的临时文件。 */
