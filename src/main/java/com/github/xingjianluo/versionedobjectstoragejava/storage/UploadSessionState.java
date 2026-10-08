@@ -16,6 +16,8 @@ public class UploadSessionState {
     private long createdAtEpochMs;
     /** partNumber -> sha256 校验和（十六进制）。 */
     private Map<Integer, String> parts = new TreeMap<>();
+    /** 完成提交后幂等返回的版本；null 表示尚未成功提交。 */
+    private StoredVersion completedVersion = null;
 
     public String getUploadId() { return uploadId; }
     public void setUploadId(String uploadId) { this.uploadId = uploadId; }
@@ -27,4 +29,6 @@ public class UploadSessionState {
     public void setCreatedAtEpochMs(long createdAtEpochMs) { this.createdAtEpochMs = createdAtEpochMs; }
     public Map<Integer, String> getParts() { return parts; }
     public void setParts(Map<Integer, String> parts) { this.parts = parts; }
+    public StoredVersion getCompletedVersion() { return completedVersion; }
+    public void setCompletedVersion(StoredVersion completedVersion) { this.completedVersion = completedVersion; }
 }

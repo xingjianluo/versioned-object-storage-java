@@ -53,6 +53,26 @@ public class MetadataStore {
         Files.move(tmp, metadataFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
+    /**
+     * 原子地完成一次分片上传：在同一次元数据落盘中
+     * 追加对象版本并把会话置为 COMPLETED（携带提交结果）。
+     * 「版本可见」与「会话已完成」要么同时生效，要么都不生效。
+     */
+    public synchronized StoredVersion commitCompletedUpload(String key, UploadSessionState session, StoredVersion version) throws IOException {
+        state.objects.computeIfAbsent(key, k -> new ArrayList<>()).add(version);
+        session.setStatus(UploadSessionState.Status.COMPLETED);
+        session.setCompletedVersion(version);
+        state.sessions.put(session.getUploadId(), session);
+        flush();
+        return version;
+    }
+
+    /** 清理上次落盘中途崩溃遗留的元数据临时文件（不触碰正式元数据文件）。 */
+    public synchronized void cleanStaleTempFile() throws IOException {
+        Path tmp = metadataFile.resolveSibling(metadataFile.getFileName() + ".tmp");
+        Files.deleteIfExists(tmp);
+    }
+
     public synchronized List<StoredVersion> listVersions(String key) {
         return List.copyOf(state.objects.getOrDefault(key, List.of()));
     }

@@ -15,6 +15,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import java.security.MessageDigest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -105,16 +106,25 @@ class StorageControllerTests {
         mvc.perform(put("/uploads/{u}/parts/2", uploadId).content(part2)
                         .header("X-Checksum-Sha256", sha256(part2)))
                 .andExpect(status().isOk());
-        mvc.perform(post("/uploads/{u}/complete", uploadId).contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isOk());
+        MvcResult completed = mvc.perform(post("/uploads/{u}/complete", uploadId).contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk()).andReturn();
+        String completedVersion = mapper.readTree(completed.getResponse().getContentAsString()).get("versionId").asText();
         mvc.perform(get("/objects/file"))
                 .andExpect(status().isOk())
                 .andExpect(result -> assertEquals("hello-world", result.getResponse().getContentAsString()));
 
-        // 已完成会话再操作 -> 409 SESSION_EXPIRED；不存在会话 -> 404 SESSION_NOT_FOUND。
-        mvc.perform(post("/uploads/{u}/complete", uploadId).contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.code").value("SESSION_EXPIRED"));
+        // 已完成会话再次 complete：幂等重试，返回同一个版本（200），不产生新版本、不报 SESSION_EXPIRED。
+        MvcResult retried = mvc.perform(post("/uploads/{u}/complete", uploadId).contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.versionId").value(completedVersion))
+                .andReturn();
+        log.info("REST complete 幂等重试: uploadId={} 首次={} 重试={} 相同={}",
+                uploadId, completedVersion,
+                mapper.readTree(retried.getResponse().getContentAsString()).get("versionId").asText(),
+                completedVersion.equals(mapper.readTree(retried.getResponse().getContentAsString()).get("versionId").asText()));
+        mvc.perform(get("/objects/file/versions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1));
         mvc.perform(post("/uploads/{u}/complete", "missing").contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("SESSION_NOT_FOUND"));
@@ -138,7 +148,55 @@ class StorageControllerTests {
                 .andExpect(jsonPath("$.code").value("VERSION_NOT_FOUND"));
         MvcResult gc = mvc.perform(post("/admin/gc")).andExpect(status().isOk()).andReturn();
         JsonNode gcBody = mapper.readTree(gc.getResponse().getContentAsString());
-        log.info("REST GC: removedCount={}", gcBody.get("removedCount").asInt());
-        assertEquals(1, gcBody.get("removedCount").asInt(), "v1 内容已无任何版本引用，必须被回收");
+        log.info("REST GC: removedCount={} removed={}", gcBody.get("removedCount").asInt(), gcBody.get("removed"));
+        // 判定依据：v1 内容必须出现在回收列表中（不依赖其他用例残留的精确计数）。
+        String v1Hash = sha256("v1-content".getBytes());
+        assertTrue(gcBody.get("removed").toString().contains(v1Hash), "v1 内容已无任何版本引用，必须被回收");
+    }
+
+    @Test
+    void restCapacityView_isReadOnlyAndReportsReclaimable() throws Exception {
+        // 写入两份不同内容，随后删除其中一个对象（墓碑仍引用内容，暂不可释放）。
+        byte[] keep = "keep-me-content".getBytes();
+        byte[] drop = "drop-me-content".getBytes();
+        MvcResult putKeep = mvc.perform(put("/objects/keep").content(keep)).andExpect(status().isOk()).andReturn();
+        MvcResult putDrop = mvc.perform(put("/objects/drop").content(drop)).andExpect(status().isOk()).andReturn();
+        String dropVersion = mapper.readTree(putDrop.getResponse().getContentAsString()).get("versionId").asText();
+        log.info("REST 容量视图参数: keep={}字节 drop={}字节", keep.length, drop.length);
+
+        // 只读查询：字段齐全，调用前后对象都还在、内容没被删。
+        MvcResult cap1 = mvc.perform(get("/admin/capacity")).andExpect(status().isOk()).andReturn();
+        JsonNode body1 = mapper.readTree(cap1.getResponse().getContentAsString());
+        log.info("REST capacity(删除前): totalBytes={} referencedBytes={} reclaimableBytes={} totalBlobs={}",
+                body1.get("totalBytes").asLong(), body1.get("referencedBytes").asLong(),
+                body1.get("reclaimableBytes").asLong(), body1.get("totalBlobCount").asInt());
+        assertEquals(keep.length + drop.length, body1.get("totalBytes").asLong());
+        assertEquals(0, body1.get("reclaimableBytes").asLong(), "墓碑仍引用内容，删除后不可立即释放");
+        // 关键：容量视图不得产生删除——drop 内容仍可读取。
+        mvc.perform(get("/objects/drop")).andExpect(status().isOk());
+
+        // 删除 drop（写入墓碑，历史版本仍引用内容），再显式回收其历史版本，之后内容才计入可释放。
+        mvc.perform(delete("/objects/drop")).andExpect(status().isOk());
+        mvc.perform(get("/objects/drop")).andExpect(status().isNotFound());
+        MvcResult cap1b = mvc.perform(get("/admin/capacity")).andExpect(status().isOk()).andReturn();
+        JsonNode body1b = mapper.readTree(cap1b.getResponse().getContentAsString());
+        assertEquals(0, body1b.get("reclaimableBytes").asLong(), "删除仅写墓碑，历史版本仍引用内容，不可释放");
+        mvc.perform(post("/objects/drop/reclaim").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"versionIds\":[\"" + dropVersion + "\"]}"))
+                .andExpect(status().isOk());
+        MvcResult cap2 = mvc.perform(get("/admin/capacity")).andExpect(status().isOk()).andReturn();
+        JsonNode body2 = mapper.readTree(cap2.getResponse().getContentAsString());
+        log.info("REST capacity(回收后): totalBytes={} referencedBytes={} reclaimableBytes={} reclaimableCount={}",
+                body2.get("totalBytes").asLong(), body2.get("referencedBytes").asLong(),
+                body2.get("reclaimableBytes").asLong(), body2.get("reclaimableCount").asInt());
+        assertEquals(drop.length, body2.get("reclaimableBytes").asLong(), "仅被回收版本引用的内容计入可释放");
+        assertEquals(keep.length, body2.get("referencedBytes").asLong());
+        assertEquals(1, body2.get("reclaimableCount").asInt());
+        // 视图依旧没删：总占用与查询前相同。
+        assertEquals(keep.length + drop.length, body2.get("totalBytes").asLong(), "只读视图不得真正释放空间");
+        // keep 始终可读。
+        mvc.perform(get("/objects/keep")).andExpect(status().isOk())
+                .andExpect(result -> assertEquals(new String(keep), result.getResponse().getContentAsString()));
+        log.info("REST 判定通过: 两次 capacity 调用后 totalBytes 不变、drop 内容仍在盘上（只读）");
     }
 }

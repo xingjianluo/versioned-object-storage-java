@@ -138,4 +138,19 @@ public class StorageController {
         List<String> removed = service.garbageCollect();
         return Map.of("removed", removed, "removedCount", removed.size());
     }
+
+    /** 只读容量视图：仅统计，不删除任何内容。 */
+    @GetMapping("/admin/capacity")
+    public Map<String, Object> capacity() throws IOException {
+        var c = service.capacityView();
+        log.info("GET /admin/capacity totalBytes={} referencedBytes={} reclaimableBytes={} reclaimableCount={}",
+                c.totalBytes(), c.referencedBytes(), c.reclaimableBytes(), c.reclaimableBlobs().size());
+        return Map.of(
+                "totalBytes", c.totalBytes(),
+                "totalBlobCount", c.totalBlobCount(),
+                "referencedBytes", c.referencedBytes(),
+                "reclaimableBytes", c.reclaimableBytes(),
+                "reclaimableBlobs", c.reclaimableBlobs(),
+                "reclaimableCount", c.reclaimableBlobs().size());
+    }
 }

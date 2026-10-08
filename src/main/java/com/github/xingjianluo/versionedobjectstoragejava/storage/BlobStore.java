@@ -9,6 +9,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
@@ -84,6 +85,28 @@ public class BlobStore {
                     .forEach(hashes::add);
         }
         return hashes;
+    }
+
+    /** 单个持久化内容的只读信息：哈希与字节大小。 */
+    public record BlobInfo(String hash, long size) {
+    }
+
+    /** 列出当前磁盘上全部持久化内容（忽略临时文件）及其大小；只读，不删除任何东西。 */
+    public List<BlobInfo> listBlobInfos() throws IOException {
+        List<BlobInfo> infos = new java.util.ArrayList<>();
+        if (!Files.isDirectory(blobDir)) {
+            return infos;
+        }
+        try (Stream<Path> stream = Files.list(blobDir)) {
+            for (Path p : stream.filter(Files::isRegularFile).toList()) {
+                String name = p.getFileName().toString();
+                if (name.startsWith("tmp-")) {
+                    continue;
+                }
+                infos.add(new BlobInfo(name, Files.size(p)));
+            }
+        }
+        return infos;
     }
 
     /** 清理写入中断遗留的临时文件。 */
